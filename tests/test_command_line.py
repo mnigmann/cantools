@@ -1276,6 +1276,7 @@ BATTERY_VT(
 
         with tempfile.TemporaryDirectory() as _tmpdir:
             tmpdir = Path(_tmpdir)
+            tmpdir = Path("/tmp/output")
 
             for database in databases:
                 if isinstance(database, tuple):
@@ -1574,6 +1575,45 @@ BATTERY_VT(
                                         'tests/files/c_source/' + database_c)
                 self.assertFalse((tmpdir / fuzzer_c).exists())
                 self.assertFalse((tmpdir / fuzzer_mk).exists())
+    
+    def test_generate_c_source_raw(self):
+        databases = [
+            'motohawk',
+            'padding_bit_order',
+            'vehicle',
+            'open_actuator',
+            'floating_point',
+            'floating_point_use_float',
+            'no_signals',
+            'choices',
+            'signed',
+            'abs'
+        ]
+
+        with tempfile.TemporaryDirectory() as _tmpdir:
+            tmpdir = Path("/tmp/output")
+
+            for database in databases:
+                argv = [
+                    'cantools',
+                    'generate_c_source',
+                    '--raw',
+                    '--database-name', f'{database}_raw',
+                    f'tests/files/dbc/{database}.dbc',
+                    '-o',
+                    str(tmpdir),
+                ]
+
+                database_h = database + '_raw.h'
+                database_c = database + '_raw.c'
+                
+                with patch('sys.argv', argv):
+                    cantools._main()
+
+                self.assert_files_equal(tmpdir / database_h,
+                                        'tests/files/c_source/' + database_h)
+                self.assert_files_equal(tmpdir / database_c,
+                                        'tests/files/c_source/' + database_c)
 
 
 if __name__ == '__main__':

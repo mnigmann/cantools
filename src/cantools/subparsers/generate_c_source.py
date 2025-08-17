@@ -32,6 +32,11 @@ def _do_generate_c_source(args):
         fuzzer_filename_c,
         not args.no_floating_point_numbers,
         args.bit_fields,
+        args.compact,
+        args.raw,
+        args.full_decode,
+        args.arch_size,
+        args.access_size,
         args.use_float,
         args.node)
 
@@ -85,6 +90,24 @@ def add_subparser(subparsers):
         '--bit-fields',
         action='store_true',
         help='Use bit fields to minimize struct sizes.')
+    generate_c_source_parser.add_argument(
+        '--compact',
+        action='store_true',
+        help='Reorder struct elements for more efficient packing')
+    generate_c_source_parser.add_argument(
+        '--raw',
+        action='store_true',
+        help='Generate bit-field structs for parsing frames directly')
+    generate_c_source_parser.add_argument(
+        '--full-decode',
+        action='store_true',
+        help='Define functions and structs for fully decoding packets')
+    generate_c_source_parser.add_argument(
+        '--arch-size',
+        help='Architecture size, in bits')
+    generate_c_source_parser.add_argument(
+        '--access-size',
+        help='Alignment of the provided input buffers, in bits')
     generate_c_source_parser.add_argument(
         '-e', '--encoding',
         help='File encoding.')

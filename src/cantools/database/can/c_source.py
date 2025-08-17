@@ -354,7 +354,7 @@ STRUCT_FMT = '''\
 {comment}\
  * All signal values are as on the CAN bus.
  */
-struct {database_name}_{message_name}_t {{
+struct {database_name}_{message_name}_{suffix} {{
 {members}
 }};
 '''
@@ -796,6 +796,57 @@ class CodeGenSignal:
 
             left -= length
             index += 1
+    
+    def raw_segments(self, arch_size=8) -> Iterator[tuple[int, int, int, int, int]]:
+        if self.signal.byte_order == 'big_endian':
+            index, pos = divmod(self.signal.start, 8)
+            left = self.signal.length
+
+            while left > 0:
+                if left >= (pos + 1):
+                    # Segment extends beyond the current byte
+                    length = (pos + 1)
+                    pos = 7
+                    shift = left - length
+                    startpos = 0
+                    mask = ((1 << length) - 1)
+                else:
+                    # Segment is contained within the current byte
+                    length = left
+                    shift = length - (pos + 1)
+                    startpos = -shift
+                    mask = ((1 << length) - 1) << startpos
+
+                index, newstart = divmod(index*8 + startpos, arch_size)
+                yield index, shift - newstart + startpos, mask, newstart, length
+
+                left -= length
+                index += 1
+        else:
+            index, pos = divmod(self.signal.start, arch_size)
+            left = self.signal.length
+
+            while left > 0:
+                shift = self.signal.length - left - pos
+
+                if left >= (arch_size - pos):
+                    # Segment extends beyond the current word
+                    length = (arch_size - pos)
+                    mask = ((1 << length) - 1)
+                    startpos = pos
+                    mask <<= pos
+                    pos = 0
+                else:
+                    # Segment is contained within the current word
+                    length = left
+                    mask = ((1 << length) - 1)
+                    startpos = pos
+                    mask <<= pos
+
+                yield index, shift, mask, startpos, length
+
+                left -= length
+                index += 1
 
 
 class CodeGenMessage:
@@ -881,13 +932,43 @@ def _format_range(cg_signal: "CodeGenSignal") -> str:
         return '-'
 
 
-def _generate_signal(cg_signal: "CodeGenSignal", bit_fields: bool) -> str:
+def _generate_signal(cg_signal: "CodeGenSignal", bit_fields: bool, raw: bool, decoded: bool) -> str:
     comment = _format_comment(cg_signal.signal.comment)
     range_ = _format_range(cg_signal)
     scale = _get(cg_signal.signal.conversion.scale, '-')
     offset = _get(cg_signal.signal.conversion.offset, '-')
+    type_name = cg_signal.type_name
+    if raw and type_name == "float":
+        type_name = "uint32_t"
+    if raw and type_name == "double":
+        type_name = "uint64_t"
 
-    if cg_signal.signal.conversion.is_float or not bit_fields:
+    if raw:
+        s = sorted([(index*8+startpos, shift-8*index, length) for index, shift, mask, startpos, length in cg_signal.raw_segments()])
+        print(s)
+        segments = []
+        for pos, shift, length in s:
+            if segments and segments[-1][0]+segments[-1][2] == pos and segments[-1][0]+segments[-1][1]+segments[-1][2] == pos+shift:
+                print("merging", segments[-1])
+                segments[-1] = (segments[-1][0], segments[-1][1], segments[-1][2] + length)
+                print("became", segments[-1])
+            else:
+                segments.append((pos, shift, length))
+        print("seg", segments)
+        members = []
+        for i, (pos, shift, length) in enumerate(segments):
+            if length <= 8:
+                type_name = ("int8_t" if i==0 and cg_signal.signal.is_signed else "uint8_t")
+            member = SIGNAL_MEMBER_FMT.format(comment=comment,
+                                              range=range_,
+                                              scale=scale,
+                                              offset=offset,
+                                              type_name=type_name,
+                                              name=cg_signal.snake_name + (f'__seg{i}' if len(segments) > 1 else ''),
+                                              length=f' : {length}')
+            members.append((pos, length, member))
+        return members
+    elif cg_signal.signal.conversion.is_float or not bit_fields:
         length = ''
     else:
         length = f' : {cg_signal.signal.length}'
@@ -896,11 +977,10 @@ def _generate_signal(cg_signal: "CodeGenSignal", bit_fields: bool) -> str:
                                       range=range_,
                                       scale=scale,
                                       offset=offset,
-                                      type_name=cg_signal.type_name,
+                                      type_name=type_name,
                                       name=cg_signal.snake_name,
                                       length=length)
-
-    return member
+    return [(cg_signal.signal.start, cg_signal.signal.length, member)]
 
 
 def _format_pack_code_mux(cg_message: "CodeGenMessage",
@@ -1177,22 +1257,35 @@ def _format_unpack_code(cg_message: "CodeGenMessage",
     if variable_lines:
         variable_lines = [*sorted(set(variable_lines)), "", ""]
 
+    print(variable_lines)
+    print(body_lines)
+
     return '\n'.join(variable_lines), '\n'.join(body_lines)
 
 
-def _generate_struct(cg_message: "CodeGenMessage", bit_fields: bool) -> tuple[str, list[str]]:
+def _generate_struct(cg_message: "CodeGenMessage", bit_fields: bool, raw: bool = False, decoded: bool = False, arch_size: Optional[int] = None, access_size: Optional[int] = None) -> tuple[str, list[str]]:
     members = []
-
+    if arch_size == None: arch_size = 8
+    if raw:
+        for sig in cg_message.cg_signals:
+            if sig.signal.is_multiplexer:
+                print("Message {} is multiplexed, no raw struct generated".format(cg_message.message.name))
+                return '', []
     for cg_signal in cg_message.cg_signals:
-        members.append(_generate_signal(cg_signal, bit_fields))
+        print(list(cg_signal.segments(False)))
+        members += _generate_signal(cg_signal, bit_fields, raw, decoded)
+
+    if raw:
+        for m in members:
+            print(m)
 
     if not members:
-        members = [
+        members = [(0, 0, 
             '    /**\n'
             '     * Dummy signal in empty message.\n'
             '     */\n'
             '    uint8_t dummy;'
-        ]
+        )]
 
     if cg_message.message.comment is None:
         comment = ''
@@ -1392,18 +1485,44 @@ def _generate_signal_name_macros(database_name: str,
 def _generate_structs(database_name: str,
                       cg_messages: list["CodeGenMessage"],
                       bit_fields: bool,
+                      raw: bool,
+                      decoded: bool,
                       node_name: Optional[str]) -> str:
     structs = []
 
     for cg_message in cg_messages:
         if _is_sender_or_receiver(cg_message, node_name):
-            comment, members = _generate_struct(cg_message, bit_fields)
+            comment, members = _generate_struct(cg_message, bit_fields, False, False)
             structs.append(
                 STRUCT_FMT.format(comment=comment,
                                   database_message_name=cg_message.message.name,
                                   message_name=cg_message.snake_name,
                                   database_name=database_name,
-                                  members='\n\n'.join(members)))
+                                  members='\n\n'.join(x[2] for x in members),
+                                  suffix='t'))
+
+    if raw:
+        for cg_message in cg_messages:
+            if _is_sender_or_receiver(cg_message, node_name):
+                comment, members = _generate_struct(cg_message, bit_fields, True, False)
+                if not members: continue
+                members.sort(key=lambda x: x[0])
+                i = 0
+                last = 0
+                while i < len(members):
+                    diff = members[i][0] - last
+                    if diff > 0:
+                        members.insert(i, [last, diff, f"    uint32_t : {diff};"])
+                        i += 1
+                    last = members[i][0] + members[i][1]
+                    i += 1
+                structs.append(
+                    STRUCT_FMT.format(comment=comment,
+                                      database_message_name=cg_message.message.name,
+                                      message_name=cg_message.snake_name,
+                                      database_name="__attribute__((packed)) " + database_name,
+                                      members='\n\n'.join(x[2] for x in members),
+                                      suffix='r'))
 
     return '\n'.join(structs)
 
@@ -1689,6 +1808,11 @@ def generate(database: "Database",
              fuzzer_source_name: str,
              floating_point_numbers: bool = True,
              bit_fields: bool = False,
+             compact: bool = False,
+             raw: bool = False,
+             decoded: bool = False,
+             arch_size: Optional[int] = None,
+             access_size: Optional[int] = None,
              use_float: bool = False,
              node_name: Optional[str] = None,
              ) -> tuple[str, str, str, str]:
@@ -1743,7 +1867,7 @@ def generate(database: "Database",
     frame_name_macros = _generate_frame_name_macros(database_name, cg_messages, node_name)
     signal_name_macros = _generate_signal_name_macros(database_name, cg_messages, node_name)
 
-    structs = _generate_structs(database_name, cg_messages, bit_fields, node_name)
+    structs = _generate_structs(database_name, cg_messages, bit_fields, raw, decoded, node_name)
     declarations = _generate_declarations(database_name,
                                           cg_messages,
                                           floating_point_numbers,
