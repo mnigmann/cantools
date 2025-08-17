@@ -931,13 +931,49 @@ def _format_range(cg_signal: "CodeGenSignal") -> str:
     else:
         return '-'
 
+def _get_smallest_decoded_type(cg_signal: "CodeGenSignal", use_float: bool):
+    sc = cg_signal.signal.scale
+    ofs = cg_signal.signal.offset
+    type_name = _get_floating_point_type(use_float)
+    if sc % 1 == 0 and ofs % 1 == 0:
+        # Scale and offset are integers
+        if sc < 0:
+            sigmin = ((1<<cg_signal.signal.length)-1)*sc + ofs;
+            sigmax = ofs;
+        else:
+            sigmax = ((1<<cg_signal.signal.length)-1)*sc + ofs;
+            sigmin = ofs;
+        if sigmin >= 0:
+            if sigmax < (1<<8):
+                return 8, "uint8_t"
+            if sigmax < (1<<16):
+                return 16, "uint16_t"
+            if sigmax < (1<<32):
+                return 32, "uint32_t"
+            if sigmax < (1<<64):
+                return 64, "uint64_t"
+        else:
+            if sigmin >= -(1<<15) and sigmax < (1<<7):
+                return 8, "int8_t"
+            if sigmin >= -(1<<15) and sigmax < (1<<15):
+                return 16, "int16_t"
+            if sigmin >= -(1<<31) and sigmax < (1<<31):
+                return 32, "int32_t"
+            if sigmin >= -(1<<63) and sigmax < (1<<63):
+                return 64, "int64_t"
 
-def _generate_signal(cg_signal: "CodeGenSignal", bit_fields: bool, raw: bool, decoded: bool) -> str:
+    else:
+        if use_float: return 32, "float"
+        else: return 64, "double"
+
+
+def _generate_signal(cg_signal: "CodeGenSignal", bit_fields: bool, use_float: bool, raw: bool, decoded: bool) -> str:
     comment = _format_comment(cg_signal.signal.comment)
     range_ = _format_range(cg_signal)
     scale = _get(cg_signal.signal.conversion.scale, '-')
     offset = _get(cg_signal.signal.conversion.offset, '-')
     type_name = cg_signal.type_name
+    # float/double bitfields are not supported
     if raw and type_name == "float":
         type_name = "uint32_t"
     if raw and type_name == "double":
@@ -968,6 +1004,9 @@ def _generate_signal(cg_signal: "CodeGenSignal", bit_fields: bool, raw: bool, de
                                               length=f' : {length}')
             members.append((pos, length, member))
         return members
+    elif decoded:
+        bits, type_name = _get_smallest_decoded_type(cg_signal, use_float)
+        length = ''
     elif cg_signal.signal.conversion.is_float or not bit_fields:
         length = ''
     else:
@@ -1263,9 +1302,8 @@ def _format_unpack_code(cg_message: "CodeGenMessage",
     return '\n'.join(variable_lines), '\n'.join(body_lines)
 
 
-def _generate_struct(cg_message: "CodeGenMessage", bit_fields: bool, raw: bool = False, decoded: bool = False, arch_size: Optional[int] = None, access_size: Optional[int] = None) -> tuple[str, list[str]]:
+def _generate_struct(cg_message: "CodeGenMessage", bit_fields: bool, use_float: bool = False, raw: bool = False, decoded: bool = False) -> tuple[str, list[str]]:
     members = []
-    if arch_size == None: arch_size = 8
     if raw:
         for sig in cg_message.cg_signals:
             if sig.signal.is_multiplexer:
@@ -1273,7 +1311,7 @@ def _generate_struct(cg_message: "CodeGenMessage", bit_fields: bool, raw: bool =
                 return '', []
     for cg_signal in cg_message.cg_signals:
         print(list(cg_signal.segments(False)))
-        members += _generate_signal(cg_signal, bit_fields, raw, decoded)
+        members += _generate_signal(cg_signal, bit_fields, use_float, raw, decoded)
 
     if raw:
         for m in members:
@@ -1485,6 +1523,7 @@ def _generate_signal_name_macros(database_name: str,
 def _generate_structs(database_name: str,
                       cg_messages: list["CodeGenMessage"],
                       bit_fields: bool,
+                      use_float: bool,
                       raw: bool,
                       decoded: bool,
                       node_name: Optional[str]) -> str:
@@ -1492,7 +1531,7 @@ def _generate_structs(database_name: str,
 
     for cg_message in cg_messages:
         if _is_sender_or_receiver(cg_message, node_name):
-            comment, members = _generate_struct(cg_message, bit_fields, False, False)
+            comment, members = _generate_struct(cg_message, bit_fields, use_float, False, False)
             structs.append(
                 STRUCT_FMT.format(comment=comment,
                                   database_message_name=cg_message.message.name,
@@ -1504,7 +1543,7 @@ def _generate_structs(database_name: str,
     if raw:
         for cg_message in cg_messages:
             if _is_sender_or_receiver(cg_message, node_name):
-                comment, members = _generate_struct(cg_message, bit_fields, True, False)
+                comment, members = _generate_struct(cg_message, bit_fields, use_float, True, False)
                 if not members: continue
                 members.sort(key=lambda x: x[0])
                 i = 0
@@ -1523,6 +1562,19 @@ def _generate_structs(database_name: str,
                                       database_name="__attribute__((packed)) " + database_name,
                                       members='\n\n'.join(x[2] for x in members),
                                       suffix='r'))
+    
+    if decoded:
+        for cg_message in cg_messages:
+            if _is_sender_or_receiver(cg_message, node_name):
+                comment, members = _generate_struct(cg_message, bit_fields, use_float, False, True)
+                if not members: continue
+                structs.append(
+                    STRUCT_FMT.format(comment=comment,
+                                      database_message_name=cg_message.message.name,
+                                      message_name=cg_message.snake_name,
+                                      database_name=database_name,
+                                      members='\n\n'.join(x[2] for x in members),
+                                      suffix='d'))
 
     return '\n'.join(structs)
 
@@ -1867,7 +1919,7 @@ def generate(database: "Database",
     frame_name_macros = _generate_frame_name_macros(database_name, cg_messages, node_name)
     signal_name_macros = _generate_signal_name_macros(database_name, cg_messages, node_name)
 
-    structs = _generate_structs(database_name, cg_messages, bit_fields, raw, decoded, node_name)
+    structs = _generate_structs(database_name, cg_messages, bit_fields, use_float, raw, decoded, node_name)
     declarations = _generate_declarations(database_name,
                                           cg_messages,
                                           floating_point_numbers,
