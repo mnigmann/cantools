@@ -376,6 +376,23 @@ int {database_name}_{message_name}_pack(
 
 '''
 
+DECLARATION_FULL_ENCODE_FMT = '''\
+/**
+ * Encode and pack all signals in message {database_message_name}.
+ *
+ * @param[out] dst_p Buffer to pack the message into.
+ * @param[in] src_p Data to pack.
+ * @param[in] size Size of dst_p.
+ *
+ * @return Size of packed data, or negative error code.
+ */
+int {database_name}_{message_name}_full_encode(
+    uint8_t *dst_p,
+    const struct {database_name}_{message_name}_d *src_p,
+    size_t size);
+
+'''
+
 DECLARATION_UNPACK_FMT = '''\
 /**
  * Unpack message {database_message_name}.
@@ -388,6 +405,23 @@ DECLARATION_UNPACK_FMT = '''\
  */
 int {database_name}_{message_name}_unpack(
     struct {database_name}_{message_name}_t *dst_p,
+    const uint8_t *src_p,
+    size_t size);
+
+'''
+
+DECLARATION_FULL_DECODE_FMT = '''\
+/**
+ * Unpack and decode all signals in  message {database_message_name}.
+ *
+ * @param[out] dst_p Object to unpack the message into.
+ * @param[in] src_p Message to unpack.
+ * @param[in] size Size of src_p.
+ *
+ * @return zero(0) or negative error code.
+ */
+int {database_name}_{message_name}_full_decode(
+    struct {database_name}_{message_name}_d *dst_p,
     const uint8_t *src_p,
     size_t size);
 
@@ -509,6 +543,25 @@ int {database_name}_{message_name}_pack(
 
 '''
 
+DEFINITION_FULL_ENCODE_FMT = '''\
+int {database_name}_{message_name}_full_encode(
+    uint8_t *dst_p,
+    const struct {database_name}_{message_name}_d *src_p,
+    size_t size)
+{{
+{full_encode_unused}\
+{full_encode_variables}\
+    if (size < {message_length}u) {{
+        return (-EINVAL);
+    }}
+
+    memset(&dst_p[0], 0, {message_length});
+{full_encode_body}
+    return ({message_length});
+}}
+
+'''
+
 DEFINITION_UNPACK_FMT = '''\
 int {database_name}_{message_name}_unpack(
     struct {database_name}_{message_name}_t *dst_p,
@@ -617,13 +670,51 @@ INIT_SIGNAL_BODY_TEMPLATE_FMT = '''\
 
 class CodeGenSignal:
 
-    def __init__(self, signal: "Signal") -> None:
+    def __init__(self, signal: "Signal", use_float: bool = False) -> None:
         self.signal: Signal = signal
         self.snake_name = camel_to_snake_case(signal.name)
+        self.min_decoded_size, self.min_decoded_type = self._get_smallest_decoded_type(use_float)
 
     @property
     def unit(self) -> str:
         return _get(self.signal.unit, '-')
+
+    def _get_smallest_decoded_type(self, use_float: bool):
+        sc = self.signal.scale
+        ofs = self.signal.offset
+        if self.signal.is_float:
+            if self.signal.length == 32: return 32, "float"
+            else: return 64, "double"
+        if sc % 1 == 0 and ofs % 1 == 0:
+            # Scale and offset are integers
+            if sc < 0:
+                sigmin = ((1<<self.signal.length)-1)*sc + ofs;
+                sigmax = ofs;
+            else:
+                sigmax = ((1<<self.signal.length)-1)*sc + ofs;
+                sigmin = ofs;
+            if sigmin >= 0:
+                if sigmax < (1<<8):
+                    return 8, "uint8_t"
+                if sigmax < (1<<16):
+                    return 16, "uint16_t"
+                if sigmax < (1<<32):
+                    return 32, "uint32_t"
+                if sigmax < (1<<64):
+                    return 64, "uint64_t"
+            else:
+                if sigmin >= -(1<<15) and sigmax < (1<<7):
+                    return 8, "int8_t"
+                if sigmin >= -(1<<15) and sigmax < (1<<15):
+                    return 16, "int16_t"
+                if sigmin >= -(1<<31) and sigmax < (1<<31):
+                    return 32, "int32_t"
+                if sigmin >= -(1<<63) and sigmax < (1<<63):
+                    return 64, "int64_t"
+
+        else:
+            if use_float: return self.type_length, "float"
+            else: return self.type_length, "double"
 
     @property
     def type_length(self) -> int:
@@ -826,16 +917,14 @@ class CodeGenSignal:
                     pos = 7
                     shift = left - length
                     startpos = 0
-                    mask = ((1 << length) - 1)
                 else:
                     # Segment is contained within the current byte
                     length = left
                     shift = length - (pos + 1)
                     startpos = -shift
-                    mask = ((1 << length) - 1) << startpos
 
-                index, newstart = divmod(index*8 + startpos, arch_size)
-                yield index, shift - newstart + startpos, mask, newstart, length
+                n_index, newstart = divmod(index*8 + startpos, arch_size)
+                yield n_index, (left-length)-newstart, ((1 << length) - 1) << newstart, newstart, length
 
                 left -= length
                 index += 1
@@ -868,10 +957,10 @@ class CodeGenSignal:
 
 class CodeGenMessage:
 
-    def __init__(self, message: "Message") -> None:
+    def __init__(self, message: "Message", use_float: bool = False) -> None:
         self.message = message
         self.snake_name = camel_to_snake_case(message.name)
-        self.cg_signals = [CodeGenSignal(signal) for signal in message.signals]
+        self.cg_signals = [CodeGenSignal(signal, use_float) for signal in message.signals]
 
     def get_signal_by_name(self, name: str) -> "CodeGenSignal":
         for cg_signal in self.cg_signals:
@@ -883,23 +972,72 @@ class CodeGenMessage:
 class CodeGenProcessor:
 
     def __init__(self, arch_size: Optional[int] = None, access_size: Optional[int] = None) -> None:
+        self._arch_size = arch_size
         self.arch_size = arch_size
         self.access_size = access_size
         self.decoded = False
         self.pack = False
 
+        self.temp_union_size = 0
+
     def set_mode(self, decoded: bool, pack: bool) -> None:
         print("Setting mode", decoded, pack)
         self.decoded = decoded
         self.pack = pack
+        self.arch_size = self._arch_size
+        if decoded and self.arch_size is None:
+            self.arch_size = 8
+
+        self.temp_union_size = 0
 
     def format_signal(self, cg_signal: "CodeGenSignal",
                             body_lines: list[str],
                             variable_lines: list[str],
                             helper_kinds: set[THelperKind],
                             node_name: str) -> None:
-        print("Pack", self.pack)
-        if self.pack:
+        if self.arch_size is not None:
+            # Generate optimized C code for a particular processor word size
+            # Signal is double or float --> create output variable with float type
+            # Signals has scale or offset --> create output variable with integer type
+            # Signal spans more than one word --> create output variable
+            type_length = cg_signal.min_decoded_size if self.decoded else cg_signal.type_length
+            sig_length = cg_signal.signal.length
+            type_name = f'int{type_length}_t'
+            if not cg_signal.signal.is_signed:
+                type_name = 'u' + type_name
+            self.temp_union_size = max(self.temp_union_size, type_length)
+
+            if self.pack:
+                # Remove scale and offset, if enabled
+                if self.decoded:
+                    body_lines.append(f'    *(({cg_signal.type_name}*)(&(_temp_union.u{type_length}))) = (src_p->{cg_signal.snake_name} - ({cg_signal.signal.offset})) / ({cg_signal.signal.scale});')
+                else:
+                    body_lines.append(f'    *(({cg_signal.type_name}*)(&(_temp_union.u{type_length}))) = src_p->{cg_signal.snake_name};')
+                # Write segments
+                for i, (index, shift, mask, startpos, length) in enumerate(cg_signal.raw_segments(self.arch_size)):
+                    body_lines.append(f'    _temp_buf = ((uint{self.arch_size}_t*)(dst_p))[{index}]; // l {index}')
+                    if shift > 0:
+                        body_lines.append(f'    _temp_buf |= (0x{mask:x} & (_temp_union.u{type_length} >> {shift})); // w {index}')
+                    else:
+                        body_lines.append(f'    _temp_buf |= (0x{mask:x} & (((uint{self.arch_size}_t)(_temp_union.u{type_length})) << {-shift})); // w {index}')
+            else:
+                for i, (index, shift, mask, startpos, length) in enumerate(cg_signal.raw_segments(self.arch_size)):
+                    op = '|=' if i else '='
+                    body_lines.append(f'    _temp_buf = ((uint{self.arch_size}_t*)(src_p))[{index}]; // l {index}')
+                    if shift > 0:
+                        body_lines.append(f'    _temp_union.u{type_length} {op} ((uint{type_length}_t)(_temp_buf&0x{mask:x})) << {shift}; // r {index}')
+                    else:
+                        body_lines.append(f'    _temp_union.u{type_length} {op} ((uint{type_length}_t)((_temp_buf&0x{mask:x}) >> {-shift})); // r {index}')
+                # Apply sign extension if necessary
+                if type_length != sig_length and cg_signal.signal.is_signed:
+                    body_lines.append(f'    if (_temp_union.u{type_length} & 0x{(1<<(sig_length-1)):x}) _temp_union.u{type_length} |= 0x{(1<<type_length)-(1<<sig_length):x};')
+                # Apply scale and offset, if enabled
+                if self.decoded:
+                    body_lines.append(f'    *(({type_name}*)(&(dst_p->{cg_signal.snake_name}))) = (_temp_union.u{type_length} * ({cg_signal.signal.scale})) + ({cg_signal.signal.offset});')
+                else:
+                    body_lines.append(f'    *(({type_name}*)(&(dst_p->{cg_signal.snake_name}))) = _temp_union.u{type_length};')
+        elif self.pack:
+            # Default pack procedure
             if cg_signal.signal.conversion.is_float or cg_signal.signal.is_signed:
                 variable = f'    uint{cg_signal.type_length}_t {cg_signal.snake_name};'
 
@@ -926,6 +1064,7 @@ class CodeGenProcessor:
                 body_lines.append(line)
                 helper_kinds.add((shift_direction, cg_signal.type_length))
         else:
+            # Default unpack procedure
             if not _is_receiver(cg_signal, node_name):
                 return
             conversion_type_name = f'uint{cg_signal.type_length}_t'
@@ -974,6 +1113,76 @@ class CodeGenProcessor:
             return f'src_p->{signal_name}'
         else:
             return f'dst_p->{signal_name}'
+
+    def post_process_function(self,
+                              cg_message: "CodeGenMessage",
+                              body_lines: list[str],
+                              variable_lines: list[str]):
+        if self.arch_size is not None:
+            variable_lines.append(f'    uint{self.arch_size}_t _temp_buf;')
+            if self.temp_union_size > 0:
+                union_members = ''
+                s = 8
+                while s <= self.temp_union_size:
+                    union_members += f'uint{s}_t u{s}; '
+                    s = s*2
+                variable_lines.append(f'    union {{{union_members}}} _temp_union;')
+
+            contents = -1
+            dirty = False
+            stack = []
+            i = 0
+            while i < len(body_lines):
+                expr = re.search(r"^( *)(switch|case|default|break)?", body_lines[i])
+                if "//" in body_lines[i]:
+                    part = body_lines[i].split("//")[1]
+                    op = part[1]
+                    index = int(part[3:])
+                    if op == "l":
+                        print("load", contents, index, dirty)
+                        if contents < 0:
+                            contents = index
+                        elif contents == index:
+                            print("removing load for {}".format(index))
+                            body_lines.pop(i)
+                            i -= 1
+                        elif dirty:
+                            print("new load from {} to {}".format(contents, index))
+                            body_lines.insert(i, f"{expr.group(1)}((uint{self.arch_size}_t*)(dst_p))[{contents}] = _temp_buf; // s {contents}")
+                            dirty = False
+                            i += 1
+                        contents = index
+                    if op == "w":
+                        dirty = True
+                elif expr is not None and expr.group(2) == "switch":
+                    print("found switch", contents, dirty)
+                    if dirty:
+                        body_lines.insert(i-1, expr.group(1)+f"((uint{self.arch_size}_t*)(dst_p))[{contents}] = _temp_buf; // s {contents}")
+                        dirty = False
+                        i += 1
+                    print("pushing to stack", (contents, dirty))
+                    stack.append((contents, dirty))
+                elif expr is not None and (expr.group(2) == "case" or expr.group(2) == "default"):
+                    contents, dirty = stack[-1]
+                elif expr is not None and (expr.group(2) == "break"):
+                    if dirty:
+                        body_lines.insert(i, f"{expr.group(1)}((uint{self.arch_size}_t*)(dst_p))[{contents}] = _temp_buf; // s {contents}")
+                        dirty = False
+                elif body_lines[i].endswith("}"):
+                    print("popping from stack", stack.pop())
+                i += 1
+            if dirty:
+                body_lines.insert(i-1, f"    ((uint{self.arch_size}_t*)(dst_p))[{contents}] = _temp_buf; // s {contents}")
+
+        if variable_lines:
+            variable_lines = [*sorted(set(variable_lines)), "", ""]
+
+        print(body_lines)
+        print(variable_lines)
+        return body_lines, variable_lines
+
+    def post_process_level(self):
+        pass
 
 
 def _canonical(value: str) -> str:
@@ -1044,45 +1253,6 @@ def _format_range(cg_signal: "CodeGenSignal") -> str:
     else:
         return '-'
 
-def _get_smallest_decoded_type(cg_signal: "CodeGenSignal", use_float: bool):
-    sc = cg_signal.signal.scale
-    ofs = cg_signal.signal.offset
-    type_name = _get_floating_point_type(use_float)
-    if cg_signal.signal.is_float:
-        if cg_signal.signal.length == 32: return 32, "float"
-        else: return 64, "double"
-    if sc % 1 == 0 and ofs % 1 == 0:
-        # Scale and offset are integers
-        if sc < 0:
-            sigmin = ((1<<cg_signal.signal.length)-1)*sc + ofs;
-            sigmax = ofs;
-        else:
-            sigmax = ((1<<cg_signal.signal.length)-1)*sc + ofs;
-            sigmin = ofs;
-        if sigmin >= 0:
-            if sigmax < (1<<8):
-                return 8, "uint8_t"
-            if sigmax < (1<<16):
-                return 16, "uint16_t"
-            if sigmax < (1<<32):
-                return 32, "uint32_t"
-            if sigmax < (1<<64):
-                return 64, "uint64_t"
-        else:
-            if sigmin >= -(1<<15) and sigmax < (1<<7):
-                return 8, "int8_t"
-            if sigmin >= -(1<<15) and sigmax < (1<<15):
-                return 16, "int16_t"
-            if sigmin >= -(1<<31) and sigmax < (1<<31):
-                return 32, "int32_t"
-            if sigmin >= -(1<<63) and sigmax < (1<<63):
-                return 64, "int64_t"
-
-    else:
-        if use_float: return 32, "float"
-        else: return 64, "double"
-
-
 def _generate_signal(cg_signal: "CodeGenSignal", bit_fields: bool, use_float: bool, raw: bool, decoded: bool) -> str:
     comment = _format_comment(cg_signal.signal.comment)
     range_ = _format_range(cg_signal)
@@ -1121,7 +1291,7 @@ def _generate_signal(cg_signal: "CodeGenSignal", bit_fields: bool, use_float: bo
             members.append((pos, length, member))
         return members
     elif decoded:
-        bits, type_name = _get_smallest_decoded_type(cg_signal, use_float)
+        type_name = cg_signal.min_decoded_type
         length = ''
     elif cg_signal.signal.conversion.is_float or not bit_fields:
         length = ''
@@ -1208,7 +1378,6 @@ def _format_code_level(cg_message: "CodeGenMessage",
             muxes_lines += mux_lines
         else:
             cg_signal = cg_message.get_signal_by_name(signal_name)
-            print("Inserting signal", cg_signal.signal)
             
             proc.format_signal(cg_signal,
                                body_lines,
@@ -1243,12 +1412,7 @@ def _format_code(cg_message: "CodeGenMessage",
                                     helper_kinds,
                                     node_name)
 
-    if variable_lines:
-        variable_lines = [*sorted(set(variable_lines)), "", ""]
-
-    print(variable_lines)
-    print(body_lines)
-
+    body_lines, variable_lines = proc.post_process_function(cg_message, body_lines, variable_lines)
     return '\n'.join(variable_lines), '\n'.join(body_lines)
 
 
@@ -1551,6 +1715,7 @@ def _generate_declarations(database_name: str,
                            cg_messages: list["CodeGenMessage"],
                            floating_point_numbers: bool,
                            use_float: bool,
+                           decoded: bool,
                            node_name: Optional[str]) -> str:
     declarations = []
 
@@ -1594,10 +1759,18 @@ def _generate_declarations(database_name: str,
             declaration += DECLARATION_PACK_FMT.format(database_name=database_name,
                                                        database_message_name=cg_message.message.name,
                                                        message_name=cg_message.snake_name)
+            if decoded:
+                declaration += DECLARATION_FULL_ENCODE_FMT.format(database_name=database_name,
+                                                                  database_message_name=cg_message.message.name,
+                                                                  message_name=cg_message.snake_name)
         if is_receiver:
             declaration += DECLARATION_UNPACK_FMT.format(database_name=database_name,
                                                          database_message_name=cg_message.message.name,
                                                          message_name=cg_message.snake_name)
+            if decoded:
+                declaration += DECLARATION_FULL_DECODE_FMT.format(database_name=database_name,
+                                                                  database_message_name=cg_message.message.name,
+                                                                  message_name=cg_message.snake_name)
 
         if is_sender or is_receiver:
             declaration += MESSAGE_DECLARATION_INIT_FMT.format(database_name=database_name,
@@ -1618,13 +1791,15 @@ def _generate_definitions(database_name: str,
                           floating_point_numbers: bool,
                           use_float: bool,
                           decoded: bool,
+                          arch_size: Optional[int],
+                          access_size: Optional[int],
                           node_name: Optional[str],
                           ) -> tuple[str, tuple[set[THelperKind], set[THelperKind]]]:
     definitions = []
     pack_helper_kinds: set[THelperKind] = set()
     unpack_helper_kinds: set[THelperKind] = set()
 
-    proc = CodeGenProcessor(None, None)
+    proc = CodeGenProcessor(arch_size, access_size)
 
     for cg_message in cg_messages:
         signal_definitions = []
@@ -1690,6 +1865,7 @@ def _generate_definitions(database_name: str,
 
         if cg_message.message.length > 0:
             definition = ""
+            print("#### GENERATING DEFINITION FOR {} ####".format(cg_message.message.name))
             if is_sender:
                 proc.set_mode(decoded=False, pack=True)
                 pack_variables, pack_body = _format_code(cg_message,
@@ -1708,6 +1884,26 @@ def _generate_definitions(database_name: str,
                                                          pack_unused=pack_unused,
                                                          pack_variables=pack_variables,
                                                          pack_body=pack_body)
+
+                if decoded:
+                    proc.set_mode(decoded=True, pack=True)
+                    encode_variables, encode_body = _format_code(cg_message,
+                                                                 proc,
+                                                                 pack_helper_kinds,
+                                                                 node_name)
+                    encode_unused = ''
+
+                    if not encode_body:
+                        encode_unused += '    (void)src_p;\n\n'
+
+                    definition += DEFINITION_FULL_ENCODE_FMT.format(database_name=database_name,
+                                                                    database_message_name=cg_message.message.name,
+                                                                    message_name=cg_message.snake_name,
+                                                                    message_length=cg_message.message.length,
+                                                                    full_encode_unused=encode_unused,
+                                                                    full_encode_variables=encode_variables,
+                                                                    full_encode_body=encode_body)
+
             if is_receiver:
                 proc.set_mode(decoded=False, pack=False)
                 unpack_variables, unpack_body = _format_code(cg_message,
@@ -1877,7 +2073,7 @@ def generate(database: "Database",
     """
 
     date = time.ctime()
-    cg_messages = [CodeGenMessage(message) for message in database.messages]
+    cg_messages = [CodeGenMessage(message, use_float) for message in database.messages]
     include_guard = f'{database_name.upper()}_H'
     frame_id_defines = _generate_frame_id_defines(database_name, cg_messages, node_name)
     frame_length_defines = _generate_frame_length_defines(database_name,
@@ -1901,12 +2097,15 @@ def generate(database: "Database",
                                           cg_messages,
                                           floating_point_numbers,
                                           use_float,
+                                          decoded,
                                           node_name)
     definitions, helper_kinds = _generate_definitions(database_name,
                                                       cg_messages,
                                                       floating_point_numbers,
                                                       use_float,
                                                       decoded,
+                                                      arch_size,
+                                                      access_size,
                                                       node_name)
     helpers = _generate_helpers(helper_kinds)
 

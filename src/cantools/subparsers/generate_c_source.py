@@ -104,6 +104,7 @@ def add_subparser(subparsers):
         help='Define functions and structs for fully decoding packets')
     generate_c_source_parser.add_argument(
         '--arch-size',
+        type=int,
         help='Architecture size, in bits')
     generate_c_source_parser.add_argument(
         '--access-size',
