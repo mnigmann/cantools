@@ -1276,7 +1276,6 @@ BATTERY_VT(
 
         with tempfile.TemporaryDirectory() as _tmpdir:
             tmpdir = Path(_tmpdir)
-            tmpdir = Path("/tmp/output")
 
             for database in databases:
                 if isinstance(database, tuple):
@@ -1591,7 +1590,7 @@ BATTERY_VT(
         ]
 
         with tempfile.TemporaryDirectory() as _tmpdir:
-            tmpdir = Path("/tmp/output")
+            tmpdir = Path(_tmpdir)
 
             for database in databases:
                 argv = [
@@ -1606,6 +1605,47 @@ BATTERY_VT(
 
                 database_h = database + '_raw.h'
                 database_c = database + '_raw.c'
+                
+                with patch('sys.argv', argv):
+                    cantools._main()
+
+                self.assert_files_equal(tmpdir / database_h,
+                                        'tests/files/c_source/' + database_h)
+                self.assert_files_equal(tmpdir / database_c,
+                                        'tests/files/c_source/' + database_c)
+    
+    def test_generate_c_source_32bit(self):
+        databases = [
+            'motohawk',
+            'padding_bit_order',
+            'vehicle',
+            'open_actuator',
+            'floating_point',
+            'floating_point_use_float',
+            'no_signals',
+            'choices',
+            'signed',
+            'abs'
+        ]
+
+        with tempfile.TemporaryDirectory() as _tmpdir:
+            tmpdir = Path(_tmpdir)
+
+            for database in databases:
+                argv = [
+                    'cantools',
+                    'generate_c_source',
+                    '--raw',
+                    '--database-name', f'{database}_32bit',
+                    f'tests/files/dbc/{database}.dbc',
+                    '--arch-size', '32', 
+                    '--full-decode',
+                    '-o',
+                    str(tmpdir),
+                ]
+
+                database_h = database + '_32bit.h'
+                database_c = database + '_32bit.c'
                 
                 with patch('sys.argv', argv):
                     cantools._main()

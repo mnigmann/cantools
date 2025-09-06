@@ -1010,7 +1010,15 @@ class CodeGenProcessor:
             if self.pack:
                 # Remove scale and offset, if enabled
                 if self.decoded:
-                    body_lines.append(f'    *(({cg_signal.type_name}*)(&(_temp_union.u{type_length}))) = (src_p->{cg_signal.snake_name} - ({cg_signal.signal.offset})) / ({cg_signal.signal.scale});')
+                    if cg_signal.signal.scale != 1:
+                        scale_string = f" / ({cg_signal.signal.scale})"
+                    else:
+                        scale_string = ""
+                    if cg_signal.signal.offset != 0:
+                        offset_string = f" - ({cg_signal.signal.offset})"
+                    else:
+                        offset_string = ""
+                    body_lines.append(f'    *(({cg_signal.type_name}*)(&(_temp_union.u{type_length}))) = (src_p->{cg_signal.snake_name}{offset_string}){scale_string};')
                 else:
                     body_lines.append(f'    *(({cg_signal.type_name}*)(&(_temp_union.u{type_length}))) = src_p->{cg_signal.snake_name};')
                 # Write segments
@@ -1033,7 +1041,15 @@ class CodeGenProcessor:
                     body_lines.append(f'    if (_temp_union.u{type_length} & 0x{(1<<(sig_length-1)):x}) _temp_union.u{type_length} |= 0x{(1<<type_length)-(1<<sig_length):x};')
                 # Apply scale and offset, if enabled
                 if self.decoded:
-                    body_lines.append(f'    *(({type_name}*)(&(dst_p->{cg_signal.snake_name}))) = (_temp_union.u{type_length} * ({cg_signal.signal.scale})) + ({cg_signal.signal.offset});')
+                    if cg_signal.signal.scale != 1:
+                        scale_string = f" * ({cg_signal.signal.scale})"
+                    else:
+                        scale_string = ""
+                    if cg_signal.signal.offset != 0:
+                        offset_string = f" + ({cg_signal.signal.offset})"
+                    else:
+                        offset_string = ""
+                    body_lines.append(f'    *(({type_name}*)(&(dst_p->{cg_signal.snake_name}))) = (_temp_union.u{type_length}{scale_string}){offset_string};')
                 else:
                     body_lines.append(f'    *(({type_name}*)(&(dst_p->{cg_signal.snake_name}))) = _temp_union.u{type_length};')
         elif self.pack:
