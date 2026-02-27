@@ -971,12 +971,13 @@ class CodeGenMessage:
 
 class CodeGenProcessor:
 
-    def __init__(self, arch_size: Optional[int] = None, access_size: Optional[int] = None) -> None:
+    def __init__(self, arch_size: Optional[int] = None, access_size: Optional[int] = None, use_float: bool = False) -> None:
         self._arch_size = arch_size
         self.arch_size = arch_size
         self.access_size = access_size
         self.decoded = False
         self.pack = False
+        self.use_float = use_float
 
         self.temp_union_size = 0
 
@@ -1011,11 +1012,17 @@ class CodeGenProcessor:
                 # Remove scale and offset, if enabled
                 if self.decoded:
                     if cg_signal.signal.scale != 1:
-                        scale_string = f" / ({cg_signal.signal.scale})"
+                        if isinstance(cg_signal.signal.scale, float):
+                            scale_string = f" / ({float(cg_signal.signal.scale)}{'f' if self.use_float else ''})"
+                        else:
+                            scale_string = f" / ({cg_signal.signal.scale})"
                     else:
                         scale_string = ""
                     if cg_signal.signal.offset != 0:
-                        offset_string = f" - ({cg_signal.signal.offset})"
+                        if isinstance(cg_signal.signal.offset, float):
+                            offset_string = f" - ({float(cg_signal.signal.offset)}{'f' if self.use_float else ''})"
+                        else:
+                            offset_string = f" - ({cg_signal.signal.offset})"
                     else:
                         offset_string = ""
                     body_lines.append(f'    *(({cg_signal.type_name}*)(&(_temp_union.u{type_length}))) = (src_p->{cg_signal.snake_name}{offset_string}){scale_string};')
@@ -1753,14 +1760,14 @@ def _generate_declarations(database_name: str,
                         message_name=cg_message.snake_name,
                         signal_name=cg_signal.snake_name,
                         type_name=cg_signal.type_name,
-                        floating_point_type=_get_floating_point_type(use_float))
+                        floating_point_type=_get_floating_point_type(use_float and cg_signal.type_name != "double"))
                 if node_name is None or _is_receiver(cg_signal, node_name):
                     signal_declaration += SIGNAL_DECLARATION_DECODE_FMT.format(
                         database_name=database_name,
                         message_name=cg_message.snake_name,
                         signal_name=cg_signal.snake_name,
                         type_name=cg_signal.type_name,
-                        floating_point_type=_get_floating_point_type(use_float))
+                        floating_point_type=_get_floating_point_type(use_float and cg_signal.type_name != "double"))
 
             if is_sender or _is_receiver(cg_signal, node_name):
                 signal_declaration += SIGNAL_DECLARATION_IS_IN_RANGE_FMT.format(
